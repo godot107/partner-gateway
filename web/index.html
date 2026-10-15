@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Partner Price API</title>
+<style>
+  :root { --bg: #f7f8fa; --card: #fff; --ink: #1d2433; --muted: #5b6475; --line: #dde1e8; --accent: #2a6fbb;
+          --ok: #1f7a4d; --bad: #b8422e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171d; --card: #1c2028; --ink: #e6e9ef; --muted: #9aa3b2; --line: #2c323d; --accent: #6aa5e6;
+            --ok: #4cc38a; --bad: #e57a66; } }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 12px 0; }
+  h1 { font-size: 22px; margin: 0 0 4px; } h2 { font-size: 16px; margin: 0 0 8px; }
+  p.muted, .muted { color: var(--muted); }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; font: inherit;
+           cursor: pointer; } button.secondary { background: transparent; color: var(--accent);
+           border: 1px solid var(--accent); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
+  label { display: flex; flex-direction: column; font-size: 13px; color: var(--muted); }
+  input { font: inherit; padding: 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
+          color: var(--ink); }
+  .big { font-size: 28px; font-weight: 600; } .ok { color: var(--ok); } .bad { color: var(--bad); }
+  pre { white-space: pre-wrap; word-break: break-word; font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Partner Price API</h1>
+  <p class="muted">A demo of opening a machine-learning model to partners: sign-in with Cognito, per-partner access,
+    and drift monitoring. Prices come from a model trained on 1990 California census data.</p>
+
+  <div class="card" id="signedOut">
+    <h2>Sign in</h2>
+    <p class="muted">Partner staff sign in with the account they were invited with.</p>
+    <button id="signIn">Sign in</button>
+  </div>
+
+  <div id="signedIn" hidden>
+    <div class="card">
+      <h2>Signed in as <span id="who"></span></h2>
+      <p class="muted">Partner: <strong id="partner"></strong> <span id="adminTag"></span></p>
+      <button class="secondary" id="signOut">Sign out</button>
+    </div>
+    <div class="card">
+      <h2>Price a home (census block group)</h2>
+      <div class="grid" id="form"></div>
+      <p><button id="predict">Get price</button></p>
+      <div class="big" id="price"></div>
+      <pre class="muted" id="predictRaw"></pre>
+    </div>
+    <div class="card">
+      <h2>Usage and data health</h2>
+      <p class="muted">You see your own partner's numbers only; admins see every partner.</p>
+      <p><button class="secondary" id="refresh">Refresh</button></p>
+      <div id="usage"></div>
+    </div>
+  </div>
+</main>
+<script>
+const AUTH = "https://{{AUTH_DOMAIN}}", CLIENT = "{{WEB_CLIENT_ID}}", API = "{{API_URL}}";
+const REDIRECT = API.replace(/\/$/, "") + "/";
+const SCOPE = "openid email inference/predict inference/usage";
+const SAMPLE = {MedInc: 4.2, HouseAge: 25, AveRooms: 5.4, AveBedrms: 1.05, Population: 1200, AveOccup: 2.9,
+                Latitude: 34.05, Longitude: -118.25};
+const $ = (id) => document.getElementById(id);
+const store = { get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
+                set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
+                del(k) { try { sessionStorage.removeItem(k); } catch {} } };
+
+function b64url(bytes) { return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+async function pkce() {
+  const v = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(v)));
+  return [v, b64url(h)];
+}
+function claims(t) { return JSON.parse(atob(t.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))); }
+
+$("signIn").onclick = async () => {
+  const [verifier, challenge] = await pkce();
+  store.set("verifier", verifier);
+  location = `${AUTH}/oauth2/authorize?response_type=code&client_id=${CLIENT}&redirect_uri=${encodeURIComponent(REDIRECT)}`
+           + `&scope=${encodeURIComponent(SCOPE)}&code_challenge_method=S256&code_challenge=${challenge}`;
+};
+$("signOut").onclick = () => {
+  store.del("access"); store.del("id");
+  location = `${AUTH}/logout?client_id=${CLIENT}&logout_uri=${encodeURIComponent(REDIRECT)}`;
+};
+
+async function exchange(code) {
+  const r = await fetch(`${AUTH}/oauth2/token`, { method: "POST",
+    headers: {"Content-Type": "application/x-www-form-urlencoded"},
+    body: new URLSearchParams({grant_type: "authorization_code", client_id: CLIENT, code,
+                               redirect_uri: REDIRECT, code_verifier: store.get("verifier") || ""}) });
+  if (!r.ok) throw new Error("token exchange failed: " + r.status);
+  const t = await r.json();
+  store.set("access", t.access_token); store.set("id", t.id_token);
+  history.replaceState({}, "", REDIRECT);
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(API.replace(/\/$/, "") + path, { ...opts,
+    headers: {"Authorization": store.get("access"), "Content-Type": "application/json"} });
+  return [r.status, await r.json().catch(() => ({}))];
+}
+
+function render() {
+  const t = store.get("id");
+  $("signedOut").hidden = !!t; $("signedIn").hidden = !t;
+  if (!t) return;
+  const c = claims(t), groups = c["cognito:groups"] || [];
+  $("who").textContent = c.email || c["cognito:username"];
+  $("partner").textContent = groups.filter(g => g.startsWith("partner-")).join(", ") || "none";
+  $("adminTag").textContent = groups.includes("admin") ? "(admin: sees all partners)" : "";
+  $("form").innerHTML = Object.entries(SAMPLE).map(([k, v]) =>
+    `<label>${k}<input id="f_${k}" type="number" step="any" value="${v}"></label>`).join("");
+  refresh();
+}
+
+$("predict").onclick = async () => {
+  const row = Object.fromEntries(Object.keys(SAMPLE).map(k => [k, Number($("f_" + k).value)]));
+  const [s, b] = await api("/me/predict", {method: "POST", body: JSON.stringify({rows: [row]})});
+  $("price").textContent = s === 200 ? "$" + b.predictions[0].price_usd.toLocaleString() : "";
+  $("price").className = "big " + (s === 200 ? "ok" : "bad");
+  $("predictRaw").textContent = `${s} ${JSON.stringify(b, null, 1)}`;
+};
+
+async function refresh() {
+  const [s, b] = await api("/me/usage");
+  if (s !== 200) { $("usage").innerHTML = `<p class="bad">${s} ${b.message || ""}</p>`; return; }
+  const parts = Object.entries(b);
+  $("usage").innerHTML = parts.length ? parts.map(([p, v]) => `<p><strong>${p}</strong>: ${v.requests_today ?? 0}
+    requests today; data health <span class="${v.status === "drift" ? "bad" : "ok"}">${v.status || "no check yet"}</span>
+    ${v.worst_feature ? `(largest change: ${v.worst_feature}, PSI ${Number(v.worst_psi).toFixed(2)})` : ""}</p>`).join("")
+    : "<p class='muted'>No drift check has run yet.</p>";
+}
+$("refresh").onclick = refresh;
+
+(async () => {
+  const code = new URLSearchParams(location.search).get("code");
+  if (code) { try { await exchange(code); } catch (e) { alert(e.message); } }
+  render();
+})();
+</script>
+</body>
+</html>

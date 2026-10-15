@@ -1,0 +1,11 @@
+.venv/
+data/
+models/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+reports/*.log
+build/
+# real demo addresses and secrets never go in the repo
+partners.yaml
+.secrets/

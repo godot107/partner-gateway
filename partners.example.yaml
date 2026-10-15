@@ -1,0 +1,17 @@
+# Copy to partners.yaml (gitignored) and put real addresses there. Never commit partners.yaml.
+admin_email: admin@example.com          # gets every drift alert; Cognito user in group "admin"
+partners:
+  partner-a:
+    display: Partner A (realtor)
+    users: [realtor@example.com]        # Cognito users in group "partner-a"
+    alert_emails: [realtor@example.com] # SNS email subscriptions, filtered to this partner
+    rate_per_s: 5
+    burst: 10
+    quota_per_day: 1000
+  partner-b:
+    display: Partner B (lender)
+    users: [lender@example.com]
+    alert_emails: [lender@example.com]
+    rate_per_s: 1
+    burst: 2
+    quota_per_day: 50                   # small, so the demo can hit 429 quickly

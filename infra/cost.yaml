@@ -1,0 +1,29 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  partner-gateway cost guard: monthly AWS Budget on tag project=partner-gateway. Long-lived; deploy once before
+  the data and app stacks and keep it when they are torn down.
+
+Parameters:
+  BudgetUsd:
+    Type: Number
+    Default: 5
+  AlertEmail:
+    Type: String
+    Description: Where budget alerts go (deploy_cost.sh passes $ALERT_EMAIL; kept out of the repo).
+
+Resources:
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: partner-gateway-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref BudgetUsd, Unit: USD }
+        CostFilters:
+          TagKeyValue: ["user:project$partner-gateway"]
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80 }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100 }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]

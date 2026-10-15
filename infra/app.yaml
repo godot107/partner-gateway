@@ -1,0 +1,549 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  partner-gateway: a home-price model opened to two partners. Cognito (partner systems via client credentials,
+  partner staff via managed login), API Gateway REST API (scopes, per-partner API keys and usage plans, request
+  schema), a thin Lambda in front of a SageMaker serverless endpoint, per-partner request logs and drift alerts.
+  Everything scales to zero; deploy/down.sh deletes it.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: The data stack's bucket (model artifact, Lambda code, request logs).
+  ModelKey:
+    Type: String
+    Default: artifacts/model.tar.gz
+  CodeKey:
+    Type: String
+    Description: S3 key of the Lambda zip (deploy.sh uploads it under a content hash).
+  XgbImage:
+    Type: String
+    Default: 683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.7-1
+    Description: SageMaker built-in XGBoost image for the region (UNVERIFIED until the first deploy; see README).
+  DomainPrefix:
+    Type: String
+    Description: Cognito domain prefix (globally unique), e.g. partner-gateway-<random>.
+  EndpointMemoryMb:
+    Type: Number
+    Default: 2048
+    AllowedValues: [1024, 2048, 3072, 4096, 5120, 6144]
+  RateA: { Type: Number, Default: 5 }
+  BurstA: { Type: Number, Default: 10 }
+  QuotaA: { Type: Number, Default: 1000 }
+  RateB: { Type: Number, Default: 1 }
+  BurstB: { Type: Number, Default: 2 }
+  QuotaB: { Type: Number, Default: 50 }
+
+Resources:
+  # ---------------------------------------------------------------- model -------------------------------------
+  SageMakerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: sagemaker.amazonaws.com }, Action: sts:AssumeRole }
+      Policies:
+        - PolicyName: model
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${ModelKey}"
+              - Effect: Allow
+                Action: [ecr:GetAuthorizationToken, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer,
+                         ecr:BatchCheckLayerAvailability]
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, cloudwatch:PutMetricData]
+                Resource: "*"
+
+  Model:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ExecutionRoleArn: !GetAtt SageMakerRole.Arn
+      PrimaryContainer:
+        Image: !Ref XgbImage
+        ModelDataUrl: !Sub "s3://${BucketName}/${ModelKey}"
+
+  EndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      ProductionVariants:
+        - VariantName: main
+          ModelName: !GetAtt Model.ModelName
+          ServerlessConfig: { MemorySizeInMB: !Ref EndpointMemoryMb, MaxConcurrency: 2 }
+
+  Endpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointConfigName: !GetAtt EndpointConfig.EndpointConfigName
+
+  # ---------------------------------------------------------------- identity ----------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: partner-gateway
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true            # invitation only: no public sign-up
+        InviteMessageTemplate:
+          EmailSubject: "Your Partner Price API demo account"
+          EmailMessage: >-
+            You've been invited to the Partner Price API demo. Username: {username}. Temporary password: {####}.
+            Sign in from the demo page; you'll be asked to choose a new password.
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: verified_email, Priority: 1 }]
+      MfaConfiguration: "OPTIONAL"
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy: { MinimumLength: 12, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true,
+                          RequireSymbols: false, TemporaryPasswordValidityDays: 7 }
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref DomainPrefix
+
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: inference
+      Name: Price inference API
+      Scopes:
+        - { ScopeName: predict, ScopeDescription: Get price predictions }
+        - { ScopeName: usage, ScopeDescription: Read own usage and data health }
+
+  # One app client per partner system: client-credentials grant (machine to machine).
+  ClientA:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: partner-a-system
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthScopes: [inference/predict, inference/usage]
+      AccessTokenValidity: 60
+      TokenValidityUnits: { AccessToken: minutes }
+
+  ClientB:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: partner-b-system
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthScopes: [inference/predict, inference/usage]
+      AccessTokenValidity: 60
+      TokenValidityUnits: { AccessToken: minutes }
+
+  # The web page for partner staff: authorization code + PKCE, no secret (it runs in a browser).
+  WebClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: partner-web
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, inference/predict, inference/usage]
+      CallbackURLs: [!Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1/"]
+      LogoutURLs: [!Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1/"]
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes }
+
+  GroupA:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: partner-a, Description: Partner A staff }
+  GroupB:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: partner-b, Description: Partner B staff }
+  GroupAdmin:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: admin, Description: Provider staff; see every partner }
+
+  # ---------------------------------------------------------------- alerts ------------------------------------
+  # deploy.sh subscribes the emails from partners.yaml, each filtered to its own partner (admin: all).
+  Alerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: partner-gateway-drift
+      KmsMasterKeyId: alias/aws/sns
+
+  # ---------------------------------------------------------------- functions ---------------------------------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sagemaker:InvokeEndpoint
+                Resource: !Ref Endpoint
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/logs/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/drift/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+                Condition: { StringLike: { "s3:prefix": ["logs/*"] } }
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref Alerts
+
+  PredictFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Partner-aware model call and request log
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: pgw.aws.handlers.predict
+      Role: !GetAtt LambdaRole.Arn
+      Code: { S3Bucket: !Ref BucketName, S3Key: !Ref CodeKey }
+      MemorySize: 256
+      Timeout: 29
+      ReservedConcurrentExecutions: 5          # cost cap: a runaway caller can't fan out
+      Environment:
+        Variables:
+          ENDPOINT: !GetAtt Endpoint.EndpointName
+          BUCKET: !Ref BucketName
+          CLIENTS: !Sub '{"${ClientA}": "partner-a", "${ClientB}": "partner-b"}'
+
+  UsageFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Own-partner usage and data health
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: pgw.aws.handlers.usage
+      Role: !GetAtt LambdaRole.Arn
+      Code: { S3Bucket: !Ref BucketName, S3Key: !Ref CodeKey }
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          BUCKET: !Ref BucketName
+          CLIENTS: !Sub '{"${ClientA}": "partner-a", "${ClientB}": "partner-b"}'
+
+  WebFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Sign-in page for partner staff
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: pgw.aws.handlers.web
+      Role: !GetAtt LambdaRole.Arn
+      Code: { S3Bucket: !Ref BucketName, S3Key: !Ref CodeKey }
+      MemorySize: 128
+      Timeout: 5
+      Environment:
+        Variables:
+          AUTH_DOMAIN: !Sub "${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+          WEB_CLIENT_ID: !Ref WebClient
+          API_URL: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1"
+
+  DriftFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Per-partner drift check over recent requests; emails on a new drift
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: pgw.aws.handlers.drift_job
+      Role: !GetAtt LambdaRole.Arn
+      Code: { S3Bucket: !Ref BucketName, S3Key: !Ref CodeKey }
+      MemorySize: 256
+      Timeout: 120
+      Environment:
+        Variables:
+          BUCKET: !Ref BucketName
+          TOPIC_ARN: !Ref Alerts
+
+  DriftSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Drift check every 30 minutes while the demo is up
+      ScheduleExpression: rate(30 minutes)
+      Targets: [{ Id: drift, Arn: !GetAtt DriftFn.Arn }]
+
+  DriftSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DriftFn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DriftSchedule.Arn
+
+  # ---------------------------------------------------------------- API ---------------------------------------
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: partner-gateway
+      EndpointConfiguration: { Types: [REGIONAL] }
+
+  Authorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      RestApiId: !Ref Api
+      Name: cognito
+      Type: COGNITO_USER_POOLS
+      ProviderARNs: [!GetAtt UserPool.Arn]
+      IdentitySource: method.request.header.Authorization
+
+  BodyValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties: { RestApiId: !Ref Api, Name: body, ValidateRequestBody: true, ValidateRequestParameters: false }
+
+  # Identical to pgw.schema.REQUEST (tests/test_core.py checks it).
+  PredictModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref Api
+      Name: PredictRequest
+      ContentType: application/json
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        title: PredictRequest
+        type: object
+        additionalProperties: false
+        required: [rows]
+        properties:
+          rows:
+            type: array
+            minItems: 1
+            maxItems: 100
+            items:
+              type: object
+              additionalProperties: false
+              required: [MedInc, HouseAge, AveRooms, AveBedrms, Population, AveOccup, Latitude, Longitude]
+              properties:
+                MedInc: { type: number, minimum: 0, maximum: 20 }
+                HouseAge: { type: number, minimum: 0, maximum: 100 }
+                AveRooms: { type: number, minimum: 0, maximum: 200 }
+                AveBedrms: { type: number, minimum: 0, maximum: 50 }
+                Population: { type: number, minimum: 0, maximum: 50000 }
+                AveOccup: { type: number, minimum: 0, maximum: 1500 }
+                Latitude: { type: number, minimum: 32, maximum: 42.5 }
+                Longitude: { type: number, minimum: -125, maximum: -114 }
+
+  PredictResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: { RestApiId: !Ref Api, ParentId: !GetAtt Api.RootResourceId, PathPart: predict }
+  MeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: { RestApiId: !Ref Api, ParentId: !GetAtt Api.RootResourceId, PathPart: me }
+  MePredictResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: { RestApiId: !Ref Api, ParentId: !Ref MeResource, PathPart: predict }
+  MeUsageResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: { RestApiId: !Ref Api, ParentId: !Ref MeResource, PathPart: usage }
+
+  # Partner systems: token with the predict scope AND the partner's API key (usage plan = quota + throttle).
+  PredictMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref PredictResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref Authorizer
+      AuthorizationScopes: [inference/predict]
+      ApiKeyRequired: true
+      RequestValidatorId: !Ref BodyValidator
+      RequestModels: { application/json: !Ref PredictModel }
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PredictFn.Arn}/invocations"
+
+  # Partner staff on the web page: token with the predict scope; their group decides the partner.
+  MePredictMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref MePredictResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref Authorizer
+      AuthorizationScopes: [inference/predict]
+      RequestValidatorId: !Ref BodyValidator
+      RequestModels: { application/json: !Ref PredictModel }
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PredictFn.Arn}/invocations"
+
+  MeUsageMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref MeUsageResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref Authorizer
+      AuthorizationScopes: [inference/usage]
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsageFn.Arn}/invocations"
+
+  WebMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !GetAtt Api.RootResourceId
+      HttpMethod: GET
+      AuthorizationType: NONE                     # the page itself is public; everything it calls is not
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebFn.Arn}/invocations"
+
+  PredictPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PredictFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"
+  UsagePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UsageFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"
+  WebPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"
+
+  # Readable JSON errors from the gateway itself (401/403/429/400 never reach the Lambda).
+  Default4xx:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref Api
+      ResponseType: DEFAULT_4XX
+      ResponseTemplates:
+        application/json: '{"message": $context.error.messageString, "detail": "$context.error.validationErrorString"}'
+
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [PredictMethod, MePredictMethod, MeUsageMethod, WebMethod, Default4xx]
+    Properties:
+      RestApiId: !Ref Api
+
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref Api
+      DeploymentId: !Ref Deployment
+      StageName: v1
+      MethodSettings:
+        - { ResourcePath: "/*", HttpMethod: "*", ThrottlingRateLimit: 10, ThrottlingBurstLimit: 20,
+            MetricsEnabled: true }
+
+  UsagePlanA:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: Stage
+    Properties:
+      UsagePlanName: partner-a
+      ApiStages: [{ ApiId: !Ref Api, Stage: v1 }]
+      Throttle: { RateLimit: !Ref RateA, BurstLimit: !Ref BurstA }
+      Quota: { Limit: !Ref QuotaA, Period: DAY }
+  UsagePlanB:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: Stage
+    Properties:
+      UsagePlanName: partner-b
+      ApiStages: [{ ApiId: !Ref Api, Stage: v1 }]
+      Throttle: { RateLimit: !Ref RateB, BurstLimit: !Ref BurstB }
+      Quota: { Limit: !Ref QuotaB, Period: DAY }
+  KeyA:
+    Type: AWS::ApiGateway::ApiKey
+    Properties: { Name: partner-a, Enabled: true }
+  KeyB:
+    Type: AWS::ApiGateway::ApiKey
+    Properties: { Name: partner-b, Enabled: true }
+  PlanKeyA:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties: { KeyId: !Ref KeyA, KeyType: API_KEY, UsagePlanId: !Ref UsagePlanA }
+  PlanKeyB:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties: { KeyId: !Ref KeyB, KeyType: API_KEY, UsagePlanId: !Ref UsagePlanB }
+
+  # ---------------------------------------------------------------- dashboard ---------------------------------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: partner-gateway
+      DashboardBody: !Sub |
+        {"widgets": [
+          {"type": "metric", "x": 0, "y": 0, "width": 12, "height": 6, "properties": {
+            "title": "Rows priced per partner", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+            "metrics": [["partner-gateway", "Rows", "Partner", "partner-a"], ["...", "partner-b"]]}},
+          {"type": "metric", "x": 12, "y": 0, "width": 12, "height": 6, "properties": {
+            "title": "Drift (worst PSI; above 0.25 = shifted)", "region": "${AWS::Region}", "stat": "Maximum",
+            "period": 1800, "metrics": [["partner-gateway", "WorstPSI", "Partner", "partner-a"], ["...", "partner-b"]],
+            "annotations": {"horizontal": [{"value": 0.25, "label": "shifted"}]}}},
+          {"type": "metric", "x": 0, "y": 6, "width": 12, "height": 6, "properties": {
+            "title": "Gateway responses", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+            "metrics": [["AWS/ApiGateway", "Count", "ApiName", "partner-gateway", "Stage", "v1"],
+                        [".", "4XXError", ".", ".", ".", "."], [".", "5XXError", ".", ".", ".", "."]]}},
+          {"type": "metric", "x": 12, "y": 6, "width": 12, "height": 6, "properties": {
+            "title": "Model call latency (ms)", "region": "${AWS::Region}", "stat": "p90", "period": 300,
+            "metrics": [["partner-gateway", "LatencyMs", "Partner", "partner-a"], ["...", "partner-b"]]}}
+        ]}
+
+Outputs:
+  ApiId:
+    Value: !Ref Api
+  ApiUrl:
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1"
+  WebPage:
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/v1/"
+  TokenUrl:
+    Value: !Sub "https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/token"
+  UserPoolId:
+    Value: !Ref UserPool
+  ClientIdA:
+    Value: !Ref ClientA
+  ClientIdB:
+    Value: !Ref ClientB
+  WebClientId:
+    Value: !Ref WebClient
+  ApiKeyIdA:
+    Value: !Ref KeyA
+  ApiKeyIdB:
+    Value: !Ref KeyB
+  DriftFunction:
+    Value: !Ref DriftFn
+  TopicArn:
+    Value: !Ref Alerts
+  EndpointName:
+    Value: !GetAtt Endpoint.EndpointName

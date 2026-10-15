@@ -1,0 +1,3 @@
+iac:
+  format: table
+  fail-on: high

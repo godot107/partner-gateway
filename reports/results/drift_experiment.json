@@ -1,0 +1,65 @@
+[
+ {
+  "case": "none",
+  "severity": 1.0,
+  "false alarms before change": 0.075,
+  "detected within 200 requests": 0.0,
+  "median requests to detect": NaN,
+  "MAE before ($100k)": 0.30121989155,
+  "MAE after ($100k)": 0.299254652625
+ },
+ {
+  "case": "units",
+  "severity": 0.9,
+  "false alarms before change": 0.075,
+  "detected within 200 requests": 0.0,
+  "median requests to detect": NaN,
+  "MAE before ($100k)": 0.30121989155,
+  "MAE after ($100k)": 0.305526039225
+ },
+ {
+  "case": "units",
+  "severity": 0.75,
+  "false alarms before change": 0.075,
+  "detected within 200 requests": 1.0,
+  "median requests to detect": 50.0,
+  "MAE before ($100k)": 0.30121989155,
+  "MAE after ($100k)": 0.373195935
+ },
+ {
+  "case": "units",
+  "severity": 0.5,
+  "false alarms before change": 0.075,
+  "detected within 200 requests": 1.0,
+  "median requests to detect": 20.0,
+  "MAE before ($100k)": 0.30121989155,
+  "MAE after ($100k)": 0.55317512885
+ },
+ {
+  "case": "units",
+  "severity": 0.1,
+  "false alarms before change": 0.075,
+  "detected within 200 requests": 1.0,
+  "median requests to detect": 15.0,
+  "MAE before ($100k)": 0.30121989155,
+  "MAE after ($100k)": 0.6308743286499999
+ },
+ {
+  "case": "market",
+  "severity": 0.3,
+  "false alarms before change": 0.075,
+  "detected within 200 requests": 0.975,
+  "median requests to detect": 65.0,
+  "MAE before ($100k)": 0.30121989155,
+  "MAE after ($100k)": 0.31512203765
+ },
+ {
+  "case": "market",
+  "severity": 1.0,
+  "false alarms before change": 0.075,
+  "detected within 200 requests": 1.0,
+  "median requests to detect": 20.0,
+  "MAE before ($100k)": 0.30121989155,
+  "MAE after ($100k)": 0.337890672775
+ }
+]

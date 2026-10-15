@@ -1,0 +1,9 @@
+numpy>=1.26,<2.3
+pandas>=2.2
+scikit-learn>=1.6
+xgboost==1.7.6          # matches the SageMaker built-in XGBoost 1.7-1 container
+boto3>=1.35
+botocore[crt]           # needed for `aws login` credentials
+jsonschema>=4.20
+pyyaml>=6.0
+matplotlib>=3.9
