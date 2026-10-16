@@ -98,15 +98,17 @@ deploy/down.sh --all                                  # delete everything but th
 `deploy.sh` invites each address in `partners.yaml` (Cognito's built-in email sends a temporary password) and
 subscribes the alert addresses to drift emails, each filtered to its own partner (SNS asks each address to confirm).
 
-**Not yet verified on AWS:** the built-in XGBoost image URI for the region (`XgbImage` in `infra/app.yaml`), whether
-API Gateway answers 401 or 403 for a missing scope, and current Cognito pricing for client-credentials tokens.
-Check before the first deploy; the demo prints what it actually gets.
+**Checked before the first deploy:** the built-in XGBoost image for us-east-1 (`XgbImage` in `infra/app.yaml`)
+matches the SageMaker SDK's registry; serverless endpoints can't capture request data themselves, which is why the
+Lambda logs every request. **Still open:** whether a REST API answers 401 or 403 for a missing scope (HTTP APIs
+answer 403); the demo prints what it actually gets.
 
 ## Cost
 
 Everything scales to zero: the SageMaker endpoint is serverless, the API and functions are per request, the bucket
 holds kilobytes and request logs expire after 30 days. Cognito charges per monthly active user and, for
-machine-to-machine tokens, per client and token request; check current prices. A $5 budget alert is deployed first.
+machine-to-machine tokens, per successful token request (the per-client fee was dropped in November 2025); a demo
+run needs a handful of tokens. A $5 budget alert is deployed first.
 `deploy/down.sh --all` removes everything except the budget.
 
 ## Layout

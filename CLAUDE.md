@@ -21,8 +21,7 @@ deploy/deploy_cost.sh (once) ; deploy/deploy.sh ; deploy/down.sh [--all]     # n
   for people need only the token; the Cognito group decides the partner. HTTP APIs can't do API keys or usage
   plans, so it's a REST API.
 - **Thin Lambda, not a direct SageMaker integration** (pet-cnn uses the direct one): each request must be logged
-  under its partner for drift monitoring, and serverless endpoints are assumed not to capture data themselves
-  (verify). The Lambda code is pure Python + boto3: `service.py` and `drift.py` are shared with the local gateway,
+  under its partner for drift monitoring, and serverless endpoints can't capture data themselves (verified). The Lambda code is pure Python + boto3: `service.py` and `drift.py` are shared with the local gateway,
   so `demo-local` exercises the same logic.
 - **Model:** SageMaker built-in XGBoost container, model saved in XGBoost's binary format (`xgboost-model`), no
   pickle, no custom inference code. Trained on plain arrays (no feature names) because the container builds an
@@ -33,8 +32,11 @@ deploy/deploy_cost.sh (once) ; deploy/deploy.sh ; deploy/down.sh [--all]     # n
   email per new drift (SNS filter policy per partner; admin gets all).
 - **Addresses:** real demo addresses (willieman.com, the user's choice) live only in gitignored `partners.yaml`
   and in AWS. Cognito built-in email sends invitations (user's choice; SES from willieman.com is a later option).
-- **Unverified until the first deploy:** `XgbImage` URI; 401 vs 403 for a missing scope; Cognito M2M pricing;
-  serverless data capture support.
+- **Verified 2026-10-16:** `XgbImage` URI (683313688378 / sagemaker-xgboost:1.7-1 in us-east-1, per the SageMaker
+  SDK's image_uri_config); serverless endpoints do NOT support data capture (AWS docs exclusion list), so the thin
+  Lambda logging is required; Cognito dropped the per-M2M-app-client fee in Nov 2025, only successful token requests
+  are billed (~$2.25 per 1,000 at the first tier, third-party figure). **Still unverified:** 401 vs 403 for a missing
+  scope on a REST API Cognito authorizer (HTTP APIs answer 403); the demo prints what it gets.
 - **API Gateway redeploys:** CloudFormation doesn't redeploy an existing REST API when methods change;
   deploy.sh runs `create-deployment` after every stack update.
 - **Tags:** shared/TAGGING.md, `project=partner-gateway`. CloudBurn scan in CI; one medium finding (S3
